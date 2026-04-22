@@ -2,6 +2,7 @@ import os
 import uuid
 import asyncio
 import logging
+import tempfile
 import shutil
 from pathlib import Path
 from typing import List
@@ -9,13 +10,17 @@ from typing import List
 import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, validator
 from dotenv import load_dotenv
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
@@ -30,13 +35,13 @@ VOICE_MAP = {
 
 SILENCE_MS = 400
 OUTPUT_DIR = Path("outputs")
-TEMP_DIR = Path("temp")
+TEMP_DIR   = Path("temp")
 OUTPUT_DIR.mkdir(exist_ok=True)
 TEMP_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(title="MiniMax Multi-Voice TTS", version="1.0.0")
 
-origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,26 +57,23 @@ class TextLine(BaseModel):
     text: str
     voice: str
 
-    @field_validator("text")
-    @classmethod
+    @validator("text")
     def text_not_empty(cls, v):
         v = v.strip()
         if not v:
             raise ValueError("text must not be empty")
         return v
 
-    @field_validator("voice")
-    @classmethod
+    @validator("voice")
     def voice_must_be_valid(cls, v):
         if v not in VOICE_MAP:
-            raise ValueError(f"voice '{v}' is not valid")
+            raise ValueError(f"voice '{v}' is not valid. Choose from: {list(VOICE_MAP.keys())}")
         return v
 
 class GenerateRequest(BaseModel):
     lines: List[TextLine]
 
-    @field_validator("lines")
-    @classmethod
+    @validator("lines")
     def lines_not_empty(cls, v):
         if not v:
             raise ValueError("lines must contain at least one entry")
@@ -115,28 +117,33 @@ async def call_minimax_tts(client: httpx.AsyncClient, text: str, voice_id: str, 
     if MINIMAX_GROUP_ID:
         url = f"{MINIMAX_TTS_URL}?GroupId={MINIMAX_GROUP_ID}"
 
-    logger.info(f"[TTS] Attempt {attempt}: voice={voice_id}, text_len={len(text)}")
-    resp = await client.post(url, headers=headers, json=payload, timeout=60.0)
+    try:
+        logger.info(f"[TTS] Attempt {attempt}: voice={voice_id}, text_len={len(text)}")
+        resp = await client.post(url, headers=headers, json=payload, timeout=60.0)
 
-    if resp.status_code != 200:
-        body = resp.text[:500]
-        logger.error(f"[TTS] HTTP {resp.status_code}: {body}")
-        raise RuntimeError(f"TTS API returned {resp.status_code}: {body}")
+        if resp.status_code != 200:
+            body = resp.text[:500]
+            logger.error(f"[TTS] HTTP {resp.status_code}: {body}")
+            raise httpx.HTTPStatusError(f"TTS API returned {resp.status_code}: {body}", request=resp.request, response=resp)
 
-    content_type = resp.headers.get("content-type", "")
+        content_type = resp.headers.get("content-type", "")
 
-    if "application/json" in content_type:
-        data = resp.json()
-        audio_hex = data.get("data", {}).get("audio", "")
-        if audio_hex:
-            return bytes.fromhex(audio_hex)
-        import base64
-        audio_b64 = data.get("data", {}).get("audio", "")
-        if audio_b64:
-            return base64.b64decode(audio_b64)
-        raise ValueError(f"Unexpected JSON response: {str(data)[:300]}")
+        if "application/json" in content_type:
+            data = resp.json()
+            if "data" in data and "audio" in data["data"]:
+                import base64
+                audio_b64 = data["data"]["audio"]
+                return base64.b64decode(audio_b64)
+            audio_hex = data.get("data", {}).get("audio", "")
+            if audio_hex:
+                return bytes.fromhex(audio_hex)
+            raise ValueError(f"Unexpected JSON response: {str(data)[:300]}")
 
-    return resp.content
+        return resp.content
+
+    except (httpx.TimeoutException, httpx.NetworkError) as e:
+        logger.error(f"[TTS] Network error: {e}")
+        raise
 
 async def fetch_audio_with_retry(client: httpx.AsyncClient, text: str, voice_id: str) -> bytes:
     try:
@@ -155,10 +162,12 @@ async def merge_audio_files(clip_paths: List[Path], output_path: Path, silence_m
     silence_sec = silence_ms / 1000.0
 
     silence_cmd = [
-        "ffmpeg", "-y", "-f", "lavfi",
+        "ffmpeg", "-y",
+        "-f", "lavfi",
         "-i", f"anullsrc=channel_layout=mono:sample_rate=32000",
         "-t", str(silence_sec),
-        "-codec:a", "libmp3lame", "-b:a", "128k",
+        "-codec:a", "libmp3lame",
+        "-b:a", "128k",
         str(silence_path),
     ]
 
@@ -169,6 +178,7 @@ async def merge_audio_files(clip_paths: List[Path], output_path: Path, silence_m
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
+        logger.error(f"[ffmpeg silence] {stderr.decode()}")
         raise RuntimeError("Failed to generate silence clip")
 
     interleaved = []
@@ -183,9 +193,13 @@ async def merge_audio_files(clip_paths: List[Path], output_path: Path, silence_m
             f.write(f"file '{p.resolve()}'\n")
 
     concat_cmd = [
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
         "-i", str(concat_file),
-        "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "32000",
+        "-codec:a", "libmp3lame",
+        "-b:a", "128k",
+        "-ar", "32000",
         str(output_path),
     ]
 
@@ -200,22 +214,24 @@ async def merge_audio_files(clip_paths: List[Path], output_path: Path, silence_m
     concat_file.unlink(missing_ok=True)
 
     if proc2.returncode != 0:
+        logger.error(f"[ffmpeg concat] {stderr2.decode()}")
         raise RuntimeError("Failed to merge audio clips")
 
 def cleanup_temp_dir(session_dir: Path):
     try:
         shutil.rmtree(session_dir, ignore_errors=True)
     except Exception as e:
-        logger.warning(f"[cleanup] Failed: {e}")
+        logger.warning(f"[cleanup] Failed to remove {session_dir}: {e}")
 
 @app.post("/generate-audio", response_model=GenerateResponse)
 async def generate_audio(req: GenerateRequest, background_tasks: BackgroundTasks):
     if not MINIMAX_API_KEY:
-        raise HTTPException(status_code=500, detail="MINIMAX_API_KEY not set")
+        raise HTTPException(status_code=500, detail="Server configuration error: MINIMAX_API_KEY not set")
 
     session_id = uuid.uuid4().hex
     session_dir = TEMP_DIR / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
+
     clip_paths: List[Path] = []
 
     async with httpx.AsyncClient() as client:
@@ -225,7 +241,10 @@ async def generate_audio(req: GenerateRequest, background_tasks: BackgroundTasks
                 audio_bytes = await fetch_audio_with_retry(client, line.text, voice_id)
             except Exception as e:
                 cleanup_temp_dir(session_dir)
-                raise HTTPException(status_code=502, detail=f"TTS failed for line {idx+1}: {str(e)}")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"TTS API failed for line {idx+1} ('{line.text[:40]}'): {str(e)}"
+                )
 
             clip_path = session_dir / f"clip_{idx:03d}.mp3"
             clip_path.write_bytes(audio_bytes)
