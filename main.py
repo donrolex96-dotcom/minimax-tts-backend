@@ -18,6 +18,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- CONFIGURATION ---
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
 MINIMAX_GROUP_ID = os.getenv("MINIMAX_GROUP_ID", "")
 MINIMAX_TTS_URL = "https://api.minimax.chat/v1/t2a_v2"
@@ -28,14 +29,17 @@ VOICE_MAP = {
     "Father Assistant": "moss_audio_a1cd6c15-3628-11f1-aeab-ca3bf5691d07",
 }
 
-OUTPUT_DIR = Path("outputs")
-TEMP_DIR = Path("temp")
+# --- DIRECTORY SETUP ---
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "outputs"
+TEMP_DIR = BASE_DIR / "temp"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="MiniMax Multi-Voice TTS", version="1.0.0")
 
+# --- MIDDLEWARE (The Handshake) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -44,20 +48,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
+# --- STATIC FILES (Serving the MP3) ---
+app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
 
-
-# ---------------- MODELS ---------------- #
-
+# --- MODELS ---
 class TextLine(BaseModel):
     text: str
     voice: str
 
     @validator("text", pre=True, always=True)
     def text_not_empty(cls, v):
-        if v is None:
-            return v
-        if not v.strip():
+        if v is None or not str(v).strip():
             raise ValueError("text cannot be empty")
         return v
 
@@ -67,24 +68,19 @@ class TextLine(BaseModel):
             raise ValueError("Invalid voice selected")
         return v
 
-
 class GenerateRequest(BaseModel):
     lines: List[TextLine]
-
 
 class GenerateResponse(BaseModel):
     file_id: str
     download_url: str
 
-
-# ---------------- TTS CALL ---------------- #
-
+# --- TTS LOGIC ---
 async def call_tts(client, text, voice_id):
     headers = {
         "Authorization": f"Bearer {MINIMAX_API_KEY}",
         "Content-Type": "application/json",
     }
-
     payload = {
         "model": "speech-02-hd",
         "text": text,
@@ -96,99 +92,71 @@ async def call_tts(client, text, voice_id):
             "pitch": 0,
         },
     }
-
     url = MINIMAX_TTS_URL
     if MINIMAX_GROUP_ID:
         url += f"?GroupId={MINIMAX_GROUP_ID}"
 
     resp = await client.post(url, json=payload, headers=headers, timeout=60)
-
     if resp.status_code != 200:
         logger.error(f"TTS API Error: {resp.text}")
         raise RuntimeError(f"TTS failed: {resp.text[:200]}")
-
     return resp.content
-
-
-# ---------------- FILE MERGE ---------------- #
 
 async def merge_simple(files, output_path):
     if not files:
-        raise ValueError("No audio files")
-
-    if len(files) == 1:
-        shutil.copy(files[0], output_path)
-        return
-
+        raise ValueError("No audio files to merge")
     with open(output_path, "wb") as w:
         for f in files:
             with open(f, "rb") as r:
                 w.write(r.read())
 
-
-# ---------------- CLEANUP ---------------- #
-
-def cleanup(path):
+def cleanup_folder(path):
     if os.path.exists(path):
         shutil.rmtree(path, ignore_errors=True)
 
-
-# ---------------- API ---------------- #
-
+# --- API ENDPOINTS ---
 @app.post("/generate-audio", response_model=GenerateResponse)
 async def generate(req: GenerateRequest, bg: BackgroundTasks):
-
     if not req.lines:
         raise HTTPException(400, "No input lines provided")
-
     if not MINIMAX_API_KEY:
-        raise HTTPException(500, "Missing API key")
+        raise HTTPException(500, "Missing API key on server")
 
-    session = uuid.uuid4().hex
-    session_dir = TEMP_DIR / session
+    session_id = uuid.uuid4().hex
+    session_dir = TEMP_DIR / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
 
     files = []
-
     try:
         async with httpx.AsyncClient() as client:
             for i, line in enumerate(req.lines):
-                voice_id = VOICE_MAP.get(line.voice)
-
-                if not voice_id:
-                    raise HTTPException(400, f"Invalid voice: {line.voice}")
-
-                audio = await call_tts(client, line.text, voice_id)
-
+                voice_id = VOICE_MAP[line.voice]
+                audio_content = await call_tts(client, line.text, voice_id)
                 path = session_dir / f"{i}.mp3"
-                path.write_bytes(audio)
+                path.write_bytes(audio_content)
                 files.append(path)
 
-        output = OUTPUT_DIR / f"{session}.mp3"
-        await merge_simple(files, output)
+        output_file = OUTPUT_DIR / f"{session_id}.mp3"
+        await merge_simple(files, output_file)
 
     except Exception as e:
         logger.error(f"Generation error: {str(e)}")
-        cleanup(session_dir)
-        if isinstance(e, HTTPException):
-            raise e
+        if os.path.exists(session_dir):
+            shutil.rmtree(session_dir)
         raise HTTPException(500, f"Processing failed: {str(e)}")
 
-    bg.add_task(cleanup, session_dir)
+    bg.add_task(cleanup_folder, str(session_dir))
 
     return GenerateResponse(
-        file_id=session,
-        download_url=f"/outputs/{session}.mp3"
+        file_id=session_id,
+        download_url=f"/outputs/{session_id}.mp3"
     )
-
-
-# ---------------- ROUTES ---------------- #
 
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Multi-Voice TTS is Ready"}
 
-
 @app.get("/health")
 def health():
     return {"ok": True}
+    
