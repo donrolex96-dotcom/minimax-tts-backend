@@ -39,7 +39,7 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="MiniMax Multi-Voice TTS", version="1.0.0")
 
-# --- MIDDLEWARE (The Handshake) ---
+# --- MIDDLEWARE (Crucial for Vercel connection) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -48,7 +48,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- STATIC FILES (Serving the MP3) ---
+# --- STATIC FILES ---
 app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
 
 # --- MODELS ---
@@ -105,10 +105,15 @@ async def call_tts(client, text, voice_id):
 async def merge_simple(files, output_path):
     if not files:
         raise ValueError("No audio files to merge")
+    
+    # Wait 1 second to ensure the OS has finished closing the temporary files
+    await asyncio.sleep(1)
+    
     with open(output_path, "wb") as w:
         for f in files:
-            with open(f, "rb") as r:
-                w.write(r.read())
+            if os.path.exists(f):
+                with open(f, "rb") as r:
+                    w.write(r.read())
 
 def cleanup_folder(path):
     if os.path.exists(path):
@@ -135,9 +140,15 @@ async def generate(req: GenerateRequest, bg: BackgroundTasks):
                 path = session_dir / f"{i}.mp3"
                 path.write_bytes(audio_content)
                 files.append(path)
+                # Small pause to allow disk writing
+                await asyncio.sleep(0.2)
 
         output_file = OUTPUT_DIR / f"{session_id}.mp3"
         await merge_simple(files, output_file)
+        
+        # Double-check: if file is somehow empty, try one more merge
+        if os.path.getsize(output_file) == 0:
+             await merge_simple(files, output_file)
 
     except Exception as e:
         logger.error(f"Generation error: {str(e)}")
@@ -145,6 +156,7 @@ async def generate(req: GenerateRequest, bg: BackgroundTasks):
             shutil.rmtree(session_dir)
         raise HTTPException(500, f"Processing failed: {str(e)}")
 
+    # Clean up the individual parts in the background
     bg.add_task(cleanup_folder, str(session_dir))
 
     return GenerateResponse(
