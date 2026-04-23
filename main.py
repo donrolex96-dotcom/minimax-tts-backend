@@ -1,103 +1,153 @@
 import os
-import uuid
+import base64
 import logging
-import shutil
-from pathlib import Path
-from typing import List
 import httpx
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from typing import List
 from dotenv import load_dotenv
 
 load_dotenv()
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# CONFIG
-MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
-MINIMAX_TTS_URL = "https://api.minimax.chat/v1/t2a_v2"
+API_KEY = os.getenv("MINIMAX_API_KEY", "").strip()
+URL = "https://api.minimax.chat/v1/t2a_v2"
 
 VOICE_MAP = {
     "Sae Chabashira": "moss_audio_9ffcdb94-3749-11f1-8aa8-1efaa00e25e8",
-    "Haruka San": "moss_audio_01dcd58c-3664-11f1-bc6c-e264257f4e44",
+    "Haruka San": "moss_audio_01dcd58c-3664-11f1-8aa8-1efaa00e25e8",
     "Father Assistant": "moss_audio_a1cd6c15-3628-11f1-aeab-ca3bf5691d07",
 }
-
-BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE_DIR / "outputs"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
-
-class TextLine(BaseModel):
+class Line(BaseModel):
     text: str
     voice: str
 
-class GenerateRequest(BaseModel):
-    lines: List[TextLine]
+class Req(BaseModel):
+    lines: List[Line]
 
-class GenerateResponse(BaseModel):
-    file_id: str
-    download_url: str
 
-async def call_minimax(text, voice_id):
+# -------------------------
+# CORE TTS CALL (SAFE)
+# -------------------------
+async def tts(text, voice_id, retry=True):
     headers = {
-        "Authorization": f"Bearer {MINIMAX_API_KEY}",
+        "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json",
     }
+
     payload = {
-        "model": "speech-01", # Using version 01 for better compatibility
+        "model": "speech-01",
         "text": text,
         "stream": False,
-        "voice_setting": {"voice_id": voice_id, "speed": 1.0, "vol": 1.0, "pitch": 0},
+        "voice_setting": {
+            "voice_id": voice_id,
+            "speed": 1.0,
+            "vol": 1.0,
+            "pitch": 0,
+        },
     }
+
     async with httpx.AsyncClient() as client:
-        resp = await client.post(MINIMAX_TTS_URL, json=payload, headers=headers, timeout=60)
-        if resp.status_code != 200:
-            logger.error(f"Error: {resp.status_code} - {resp.text}")
-            return None
-        return resp.content
+        resp = await client.post(URL, json=payload, headers=headers, timeout=60)
 
-@app.post("/generate-audio", response_model=GenerateResponse)
-async def generate(req: GenerateRequest):
-    if not MINIMAX_API_KEY:
-        raise HTTPException(500, "API Key Missing")
+    if resp.status_code != 200:
+        logger.error(resp.text)
+        return None
 
-    session_id = uuid.uuid4().hex
-    output_path = OUTPUT_DIR / f"{session_id}.mp3"
+    # -------------------------
+    # CASE 1: JSON RESPONSE
+    # -------------------------
+    try:
+        data = resp.json()
+        audio_b64 = data.get("data", {}).get("audio")
 
-    # TEST: Only process the FIRST line to avoid merging issues
-    first_line = req.lines[0]
-    voice_id = VOICE_MAP.get(first_line.voice, VOICE_MAP["Sae Chabashira"])
-    
-    audio_data = await call_minimax(first_line.text, voice_id)
+        if audio_b64:
+            audio_bytes = base64.b64decode(audio_b64)
+            if len(audio_bytes) < 1000:  # 🔥 prevents 0:00 silent audio
+                return None
+            return audio_bytes
 
-    if audio_data is None or len(audio_data) == 0:
-        logger.error("MiniMax returned NO data. Check your API Key!")
-        raise HTTPException(500, "MiniMax API failed to return audio.")
+    except Exception:
+        pass
 
-    with open(output_path, "wb") as f:
-        f.write(audio_data)
+    # -------------------------
+    # CASE 2: RAW AUDIO
+    # -------------------------
+    if len(resp.content) < 1000:
+        return None
 
-    return GenerateResponse(
-        file_id=session_id,
-        download_url=f"/outputs/{session_id}.mp3"
-    )
+    return resp.content
+
+
+# -------------------------
+# API ENDPOINT
+# -------------------------
+@app.post("/generate-audio")
+async def generate(req: Req):
+
+    if not req.lines:
+        raise HTTPException(400, "No input text")
+
+    final_audio = []
+
+    for line in req.lines:
+        text = line.text.strip()
+        if not text:
+            continue
+
+        voice_id = VOICE_MAP.get(line.voice)
+
+        if not voice_id:
+            raise HTTPException(400, f"Invalid voice: {line.voice}")
+
+        # -------------------------
+        # TRY 1
+        # -------------------------
+        audio = await tts(text, voice_id)
+
+        # -------------------------
+        # RETRY ON FAILURE
+        # -------------------------
+        if not audio:
+            logger.warning("Retrying TTS...")
+            audio = await tts(text, voice_id, retry=False)
+
+        if not audio:
+            raise HTTPException(
+                500,
+                f"Failed to generate audio for: '{text[:30]}...'"
+            )
+
+        final_audio.append(audio)
+
+    if not final_audio:
+        raise HTTPException(500, "No valid audio generated")
+
+    # merge safely
+    merged = b"".join(final_audio)
+
+    if len(merged) < 1000:
+        raise HTTPException(500, "Generated audio is too small (invalid)")
+
+    b64 = base64.b64encode(merged).decode("utf-8")
+
+    return {
+        "audio_base64": f"data:audio/mp3;base64,{b64}"
+    }
+
 
 @app.get("/")
-def root():
-    return {"status": "working"}
-    
+def health():
+    return {"status": "OK"}
