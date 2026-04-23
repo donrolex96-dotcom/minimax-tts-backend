@@ -10,7 +10,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, validator # Back to v1 syntax
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -51,9 +51,9 @@ class TextLine(BaseModel):
     text: str
     voice: str
 
-    @validator("text")
+    @validator("text") # Fixed for Pydantic v1 compatibility
     def text_not_empty(cls, v):
-        if not v.strip():
+        if not v or not v.strip():
             raise ValueError("text cannot be empty")
         return v
 
@@ -92,24 +92,28 @@ async def call_tts(client, text, voice_id):
     resp = await client.post(url, json=payload, headers=headers, timeout=60)
 
     if resp.status_code != 200:
+        logger.error(f"TTS API Error: {resp.text}")
         raise RuntimeError(f"TTS failed: {resp.text[:200]}")
 
     return resp.content
 
 
 async def merge_simple(files, output_path):
-    # SAFE fallback (NO ffmpeg dependency)
+    if not files:
+        return
     if len(files) == 1:
         shutil.copy(files[0], output_path)
         return
 
     with open(output_path, "wb") as w:
         for f in files:
-            w.write(open(f, "rb").read())
+            with open(f, "rb") as r:
+                w.write(r.read())
 
 
 def cleanup(path):
-    shutil.rmtree(path, ignore_errors=True)
+    if os.path.exists(path):
+        shutil.rmtree(path, ignore_errors=True)
 
 
 @app.post("/generate-audio", response_model=GenerateResponse)
@@ -119,29 +123,32 @@ async def generate(req: GenerateRequest, bg: BackgroundTasks):
 
     session = uuid.uuid4().hex
     session_dir = TEMP_DIR / session
-    session_dir.mkdir()
+    session_dir.mkdir(parents=True, exist_ok=True)
 
     files = []
 
-    async with httpx.AsyncClient() as client:
-        for i, line in enumerate(req.lines):
-            voice_id = VOICE_MAP.get(line.voice)
-            if not voice_id:
-                raise HTTPException(400, "Invalid voice")
-
-            audio = await call_tts(client, line.text, voice_id)
-
-            path = session_dir / f"{i}.mp3"
-            path.write_bytes(audio)
-            files.append(path)
-
-    output = OUTPUT_DIR / f"{session}.mp3"
-
     try:
+        async with httpx.AsyncClient() as client:
+            for i, line in enumerate(req.lines):
+                voice_id = VOICE_MAP.get(line.voice)
+                if not voice_id:
+                    raise HTTPException(400, f"Invalid voice: {line.voice}")
+
+                audio = await call_tts(client, line.text, voice_id)
+
+                path = session_dir / f"{i}.mp3"
+                path.write_bytes(audio)
+                files.append(path)
+
+        output = OUTPUT_DIR / f"{session}.mp3"
         await merge_simple(files, output)
+        
     except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
         cleanup(session_dir)
-        raise HTTPException(500, f"Merge failed: {str(e)}")
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(500, f"Processing failed: {str(e)}")
 
     bg.add_task(cleanup, session_dir)
 
@@ -153,9 +160,10 @@ async def generate(req: GenerateRequest, bg: BackgroundTasks):
 
 @app.get("/")
 def root():
-    return {"status": "ok"}
+    return {"status": "ok", "message": "Multi-Voice TTS is Ready"}
 
 
 @app.get("/health")
 def health():
     return {"ok": True}
+    
