@@ -10,7 +10,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, validator # Back to v1 syntax
+from pydantic import BaseModel, validator
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -31,8 +31,8 @@ VOICE_MAP = {
 OUTPUT_DIR = Path("outputs")
 TEMP_DIR = Path("temp")
 
-OUTPUT_DIR.mkdir(exist_ok=True)
-TEMP_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="MiniMax Multi-Voice TTS", version="1.0.0")
 
@@ -47,14 +47,24 @@ app.add_middleware(
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 
 
+# ---------------- MODELS ---------------- #
+
 class TextLine(BaseModel):
     text: str
     voice: str
 
-    @validator("text") # Fixed for Pydantic v1 compatibility
+    @validator("text", pre=True, always=True)
     def text_not_empty(cls, v):
-        if not v or not v.strip():
+        if v is None:
+            return v
+        if not v.strip():
             raise ValueError("text cannot be empty")
+        return v
+
+    @validator("voice")
+    def voice_valid(cls, v):
+        if v not in VOICE_MAP:
+            raise ValueError("Invalid voice selected")
         return v
 
 
@@ -66,6 +76,8 @@ class GenerateResponse(BaseModel):
     file_id: str
     download_url: str
 
+
+# ---------------- TTS CALL ---------------- #
 
 async def call_tts(client, text, voice_id):
     headers = {
@@ -98,9 +110,12 @@ async def call_tts(client, text, voice_id):
     return resp.content
 
 
+# ---------------- FILE MERGE ---------------- #
+
 async def merge_simple(files, output_path):
     if not files:
-        return
+        raise ValueError("No audio files")
+
     if len(files) == 1:
         shutil.copy(files[0], output_path)
         return
@@ -111,13 +126,21 @@ async def merge_simple(files, output_path):
                 w.write(r.read())
 
 
+# ---------------- CLEANUP ---------------- #
+
 def cleanup(path):
     if os.path.exists(path):
         shutil.rmtree(path, ignore_errors=True)
 
 
+# ---------------- API ---------------- #
+
 @app.post("/generate-audio", response_model=GenerateResponse)
 async def generate(req: GenerateRequest, bg: BackgroundTasks):
+
+    if not req.lines:
+        raise HTTPException(400, "No input lines provided")
+
     if not MINIMAX_API_KEY:
         raise HTTPException(500, "Missing API key")
 
@@ -131,6 +154,7 @@ async def generate(req: GenerateRequest, bg: BackgroundTasks):
         async with httpx.AsyncClient() as client:
             for i, line in enumerate(req.lines):
                 voice_id = VOICE_MAP.get(line.voice)
+
                 if not voice_id:
                     raise HTTPException(400, f"Invalid voice: {line.voice}")
 
@@ -142,7 +166,7 @@ async def generate(req: GenerateRequest, bg: BackgroundTasks):
 
         output = OUTPUT_DIR / f"{session}.mp3"
         await merge_simple(files, output)
-        
+
     except Exception as e:
         logger.error(f"Generation error: {str(e)}")
         cleanup(session_dir)
@@ -158,6 +182,8 @@ async def generate(req: GenerateRequest, bg: BackgroundTasks):
     )
 
 
+# ---------------- ROUTES ---------------- #
+
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Multi-Voice TTS is Ready"}
@@ -166,4 +192,3 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True}
-    
